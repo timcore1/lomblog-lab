@@ -2,6 +2,8 @@
 
 ![ЛомБлог — учебный уязвимый стенд](.github/banner.png)
 
+<img width="1280" height="640" alt="lomblog-github-banner" src="https://github.com/user-attachments/assets/b517ea9c-5b75-4b1e-888e-e5056ff97f0e" />
+
 **Намеренно уязвимый веб-блог для обучения пентесту.**
 4 таска · флаги · Docker за 30 секунд · ноль зависимостей кроме Flask
 
