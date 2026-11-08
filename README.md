@@ -60,7 +60,7 @@ python app.py
 
 ```
 lomblog-lab/
-├── app.py              # весь стенд — один файл (~250 строк)
+├── app.py              # весь стенд — один файл (~810 строк)
 ├── requirements.txt    # flask, и всё
 ├── Dockerfile          # python:3.12-slim, multi-arch
 └── README.md
