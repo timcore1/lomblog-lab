@@ -1,0 +1,4 @@
+lomblog.db
+__pycache__/
+*.pyc
+.vscode/
