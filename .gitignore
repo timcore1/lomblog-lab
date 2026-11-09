@@ -1,4 +1,5 @@
 lomblog.db
+flag.txt
 __pycache__/
 *.pyc
 .vscode/

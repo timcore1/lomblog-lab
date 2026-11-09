@@ -6,6 +6,7 @@
 import sqlite3
 import os
 from datetime import datetime
+from urllib.parse import quote
 from flask import Flask, request, session, redirect, render_template_string, g, abort
 from markupsafe import escape
 
@@ -17,7 +18,9 @@ app.secret_key = "supersecret123"
 # Чтобы кириллица и эмодзи в JSON-ответах движка были читаемыми, а не \uXXXX
 app.json.ensure_ascii = False
 
-DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lomblog.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(BASE_DIR, "lomblog.db")
+UPLOADS = os.path.join(BASE_DIR, "uploads")  # «материалы курса» для таска 7
 
 FLAG_IDOR = "TIMCORE{id0r_1s_n0t_4_f34tur3}"
 FLAG_XSS = "TIMCORE{st0r3d_xss_n0_s4n1t1z3r_b4by}"
@@ -25,6 +28,7 @@ FLAG_KEY = "TIMCORE{w34k_s3cr3t_k3y_c00k13_f0rg3d}"
 FLAG_BACKUP = "TIMCORE{b4ckup_f1l3s_4r3_publ1c_l0l}"
 FLAG_SQLI = "TIMCORE{un10n_s3l3ct_b4by}"
 FLAG_SSTI = "TIMCORE{jinja_rce_7x7_49}"
+FLAG_TRAVERSAL = "TIMCORE{dot_dot_slash_p4th_tr4v3rs4l}"
 
 # ТАСК 6: флаг таска SSTI лежит прямо в конфиге Flask. В UI его нет —
 # достаётся только из шаблона: {{config.FLAG_SSTI}} (а {{config}} светит и SECRET_KEY)
@@ -82,7 +86,7 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS flags(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,        -- короткое имя таска: IDOR, XSS, Ключ, Бэкап, SQLi, SSTI
+        name TEXT UNIQUE,        -- короткое имя таска: IDOR, XSS, Ключ, Бэкап, SQLi, SSTI, Path
         value TEXT UNIQUE,       -- сам флаг
         points INTEGER NOT NULL,
         hint TEXT
@@ -155,10 +159,67 @@ def init_db():
             ("SSTI", FLAG_SSTI, 250,
              "Страница /hello?name= клеит имя в шаблон Jinja до рендера. Попробуй {{7*7}}, "
              "а потом {{config}} — там и флаг, и секретный ключ для таска с кукой."),
+            ("Path", FLAG_TRAVERSAL, 150,
+             "Скачивание в /download клеит путь к имени файла без нормализации. "
+             "Попробуй ?file=../flag.txt, а потом почитай соседний app.py."),
         ],
     )
     db.commit()
     db.close()
+
+
+# ТАСК 7: «материалы курса» в uploads/. Файлы декоративные — реального смысла
+# не несут, нужны только чтобы страница /files и скачивание выглядели живыми.
+UPLOAD_FILES = {
+    "report.txt": (
+        "Отчёт по безопасности «ЛомБлога» (черновик)\n"
+        "\n"
+        "Проверено:\n"
+        "  - вход в админку по паролю — ок\n"
+        "  - комментарии — ок\n"
+        "  - поиск по постам — ок\n"
+        "\n"
+        "Вывод: серьёзных проблем не обнаружено, можно катить в прод.\n"
+        "Подпись: отдел безопасности (шутка за 3000 руб.)\n"
+    ),
+    "cheatsheet.txt": (
+        "Шпаргалка по веб-безопасности (материалы курса)\n"
+        "\n"
+        "1. Никогда не доверяй пользовательскому вводу.\n"
+        "2. Параметризованные запросы — база, а не конкатенация строк.\n"
+        "3. Экранируй вывод, а не только вход.\n"
+        "4. Файлы, которые отдаёт веб-сервер, держи в отдельной папке.\n"
+        "5. Секреты — вне webroot и никогда в git.\n"
+        "6. Нормализуй путь перед открытием файла (os.path.realpath + проверка префикса).\n"
+        "\n"
+        "Курс «Этичный хакинг», модуль 4.\n"
+    ),
+    "notes.txt": (
+        "Заметки к семинару\n"
+        "\n"
+        "  - Разбирали path traversal: ../ в имени файла — классика жанра.\n"
+        "  - Домашка: найти в этом стенде все таски и сдать флаги.\n"
+        "  - Не забыть: flask-unsign и подпись куки сессии.\n"
+    ),
+}
+
+
+def ensure_lab_files():
+    """Идемпотентно создаёт uploads/ с материалами и flag.txt с флагом таска 7."""
+    os.makedirs(UPLOADS, exist_ok=True)
+    for name, text in UPLOAD_FILES.items():
+        path = os.path.join(UPLOADS, name)
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+    # ТАСК 7: в нормальном проде такие файлы лежат ВНЕ webroot (или вообще в vault),
+    # и уж точно не в корне проекта рядом с кодом. Здесь флаг намеренно положен
+    # в каталог приложения, чтобы ../flag.txt из uploads/ вёл прямо к нему.
+    # Файл в .gitignore: стенд создаёт его сам при старте, в репозиторий он не едет.
+    flag_path = os.path.join(BASE_DIR, "flag.txt")
+    if not os.path.exists(flag_path):
+        with open(flag_path, "w", encoding="utf-8") as fh:
+            fh.write(FLAG_TRAVERSAL + "\n")
 
 
 BASE = """
@@ -456,12 +517,14 @@ def nav():
                 f"<a href='/welcome'>🎯 Миссия</a> | "
                 f"<a href='/scoreboard'>🏆 Рейтинг</a> | "
                 f"<a href='/hello'>👋 Скажи привет</a> | "
+                f"<a href='/files'>📁 Материалы</a> | "
                 f"<span id='nav-points' title='твои очки'>⭐ Очки: {st['points']}</span> | "
                 f"<a href='/profile/{session['user_id']}'>Мой профиль</a> | "
                 f"<a href='/logout'>Выйти</a>")
     return ("<a href='/welcome'>🎯 Миссия</a> | "
             "<a href='/scoreboard'>🏆 Рейтинг</a> | "
             "<a href='/hello'>👋 Скажи привет</a> | "
+            "<a href='/files'>📁 Материалы</a> | "
             "<a href='/login'>Войти</a> | <a href='/register'>Регистрация</a>")
 
 
@@ -744,6 +807,51 @@ def backup_sql():
     return dump, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+# ТАСК 7: path traversal. Имя файла клеится к пути БЕЗ нормализации и проверок,
+# поэтому ../flag.txt выходит из uploads/ и читает всё, что лежит рядом с app.py.
+@app.route("/download")
+def download():
+    filename = request.args.get("file", "")
+    if not filename:
+        return redirect("/files")
+    # уязвимая строка: os.path.join ничего не нормализует, ".." остаётся как есть
+    path = os.path.join(UPLOADS, filename)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        # ошибку показываем как есть — путь видно, новичку проще понять, куда он попал
+        return page(f"<h2>Скачивание</h2>"
+                    f"<p class='warn'>Не удалось открыть файл: {escape(str(e))}</p>"
+                    f"<p class='muted'>Путь: <code>{escape(path)}</code></p>"
+                    f"<p><a href='/files'>← К материалам курса</a></p>")
+    resp = data.decode("utf-8", errors="replace")
+    return resp, 200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": f"inline; filename=\"{os.path.basename(filename)}\"",
+    }
+
+
+@app.route("/files")
+def files():
+    """Список «материалов курса» — декоративные txt-файлы из uploads/."""
+    try:
+        names = sorted(os.listdir(UPLOADS))
+    except OSError:
+        names = []
+    if names:
+        items = "".join(
+            f"<div class='post'><a href='/download?file={quote(n)}'><b>📄 {escape(n)}</b></a>"
+            f" <span class='muted'>· {os.path.getsize(os.path.join(UPLOADS, n))} байт</span></div>"
+            for n in names)
+    else:
+        items = "<p class='muted'>Пока пусто.</p>"
+    return page(f"""
+    <h2>📁 Материалы курса</h2>
+    <p class='muted'>Полезные файлы для студентов. Качаем, читаем, конспектируем.</p>
+    {items}""")
+
+
 # ===== Игровой движок: сдача флагов и рейтинг =====
 # Внимание: это НЕ уязвимые задания, а обычная логика проверки флагов.
 @app.route("/submit", methods=["POST"])
@@ -880,8 +988,9 @@ def welcome():
 
 # Инициализация при старте: идемпотентно создаёт недостающие таблицы и добивает
 # флаги, поэтому работает и на уже существующей lomblog.db, и при любом раннере
-# (python app.py, flask run, wsgi).
+# (python app.py, flask run, wsgi). ensure_lab_files() докладывает uploads/ и flag.txt.
 init_db()
+ensure_lab_files()
 
 
 if __name__ == "__main__":
