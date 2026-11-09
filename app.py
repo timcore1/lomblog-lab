@@ -481,7 +481,10 @@ def progress():
 
 
 def page(body):
-    return render_template_string(BASE % (nav(), progress(), body))
+    # Обычные страницы НЕ прогоняем через Jinja: иначе любой {{...}} из БД
+    # (подсказки, посты, комменты) исполнится и сольёт флаг/секретный ключ.
+    # Шаблонный движок включается только в таске 6 (/hello) — там это и есть дырка.
+    return BASE % (nav(), progress(), body)
 
 
 def search_form(value=""):
