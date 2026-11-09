@@ -14,10 +14,6 @@ app = Flask(__name__)
 # ТАСК 3: секретный ключ захардкожен и слабый. Так делать НЕЛЬЗЯ. Но все делают...
 app.secret_key = "supersecret123"
 
-# ТАСК 6: флаг таска SSTI лежит прямо в конфиге Flask. В UI его нет —
-# достаётся только из шаблона: {{config.FLAG_SSTI}} (а {{config}} светит и SECRET_KEY)
-app.config["FLAG_SSTI"] = "TIMCORE{jinja_rce_7x7_49}"
-
 # Чтобы кириллица и эмодзи в JSON-ответах движка были читаемыми, а не \uXXXX
 app.json.ensure_ascii = False
 
@@ -28,6 +24,11 @@ FLAG_XSS = "TIMCORE{st0r3d_xss_n0_s4n1t1z3r_b4by}"
 FLAG_KEY = "TIMCORE{w34k_s3cr3t_k3y_c00k13_f0rg3d}"
 FLAG_BACKUP = "TIMCORE{b4ckup_f1l3s_4r3_publ1c_l0l}"
 FLAG_SQLI = "TIMCORE{un10n_s3l3ct_b4by}"
+FLAG_SSTI = "TIMCORE{jinja_rce_7x7_49}"
+
+# ТАСК 6: флаг таска SSTI лежит прямо в конфиге Flask. В UI его нет —
+# достаётся только из шаблона: {{config.FLAG_SSTI}} (а {{config}} светит и SECRET_KEY)
+app.config["FLAG_SSTI"] = FLAG_SSTI
 
 # --- Геймификация ---
 HINT_PENALTY = 20  # столько очков списывается за подсказку к таску
@@ -81,7 +82,7 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS flags(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,        -- короткое имя таска: IDOR, XSS, Ключ, Бэкап, SQLi
+        name TEXT UNIQUE,        -- короткое имя таска: IDOR, XSS, Ключ, Бэкап, SQLi, SSTI
         value TEXT UNIQUE,       -- сам флаг
         points INTEGER NOT NULL,
         hint TEXT
@@ -151,6 +152,9 @@ def init_db():
             ("SQLi", FLAG_SQLI, 150,
              "Поле поиска подставляется в SQL как есть. Посмотри, сколько колонок возвращает поиск, "
              "и подгони UNION под это число: таблица secrets(id, flag)."),
+            ("SSTI", FLAG_SSTI, 250,
+             "Страница /hello?name= клеит имя в шаблон Jinja до рендера. Попробуй {{7*7}}, "
+             "а потом {{config}} — там и флаг, и секретный ключ для таска с кукой."),
         ],
     )
     db.commit()
