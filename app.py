@@ -23,6 +23,7 @@ FLAG_IDOR = "TIMCORE{id0r_1s_n0t_4_f34tur3}"
 FLAG_XSS = "TIMCORE{st0r3d_xss_n0_s4n1t1z3r_b4by}"
 FLAG_KEY = "TIMCORE{w34k_s3cr3t_k3y_c00k13_f0rg3d}"
 FLAG_BACKUP = "TIMCORE{b4ckup_f1l3s_4r3_publ1c_l0l}"
+FLAG_SQLI = "TIMCORE{un10n_s3l3ct_b4by}"
 
 # --- Геймификация ---
 HINT_PENALTY = 20  # столько очков списывается за подсказку к таску
@@ -68,9 +69,15 @@ def init_db():
         author TEXT,
         body TEXT
     );
+    -- ТАСК 5: отдельная таблица с флагом. В UI её нет вообще —
+    -- достаётся только SQL-инъекцией в поиске (UNION-based).
+    CREATE TABLE IF NOT EXISTS secrets(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        flag TEXT
+    );
     CREATE TABLE IF NOT EXISTS flags(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,        -- короткое имя таска: IDOR, XSS, Ключ, Бэкап
+        name TEXT UNIQUE,        -- короткое имя таска: IDOR, XSS, Ключ, Бэкап, SQLi
         value TEXT UNIQUE,       -- сам флаг
         points INTEGER NOT NULL,
         hint TEXT
@@ -121,6 +128,9 @@ def init_db():
             "INSERT INTO comments(post_id,author,body) VALUES(?,?,?)",
             (1, "alice", "Первый комментарий! А тут вообще фильтрация есть?"),
         )
+    # ТАСК 5: единственная строка с флагом. INSERT OR IGNORE + явный id —
+    # чтобы на существующей базе сид не дублировался при каждом старте.
+    db.execute("INSERT OR IGNORE INTO secrets(id, flag) VALUES(1, ?)", (FLAG_SQLI,))
     # Флаги сеем ВСЕГДА и идемпотентно: INSERT OR IGNORE + UNIQUE(name),
     # поэтому существующая база доживает без потерь и добивает недостающие таски
     db.executemany(
@@ -134,6 +144,9 @@ def init_db():
              "Из чего сделана кука сессии Flask? Чем она подписана и насколько секретен ключ? Погугли flask-unsign."),
             ("Бэкап", FLAG_BACKUP, 100,
              "Стандартные пути: /backup, /dump, /db.sql... или почитай второй пост блога."),
+            ("SQLi", FLAG_SQLI, 150,
+             "Поле поиска подставляется в SQL как есть. Посмотри, сколько колонок возвращает поиск, "
+             "и подгони UNION под это число: таблица secrets(id, flag)."),
         ],
     )
     db.commit()
@@ -461,6 +474,17 @@ def page(body):
     return render_template_string(BASE % (nav(), progress(), body))
 
 
+def search_form(value=""):
+    """Форма поиска по постам. Общая для главной и страницы выдачи."""
+    # value экранируем: тут нам интересна только SQLi, лишний reflected XSS не нужен
+    return (f"<div class='post'>"
+            f"<form method='get' action='/search'>"
+            f"<input name='q' value='{escape(value)}' autocomplete='off' "
+            f"placeholder='Поиск по постам: заголовок или текст...'>"
+            f"<button>🔍 Найти</button></form>"
+            f"<p class='muted'>Ищем по названию и тексту поста. LIKE всё прощает.</p></div>")
+
+
 @app.route("/")
 def index():
     uid = session.get("user_id")
@@ -489,6 +513,7 @@ def index():
                  f" <span class='tpoints'>· {f['points']} очков</span></div>"
                  f"{hint_html}</div>{mark}</div>")
     posts = db.execute("SELECT * FROM posts ORDER BY id").fetchall()
+    body += "<h2>Поиск</h2>" + search_form()
     body += "<h2>Посты</h2>" + "".join(
         f"<div class='post'><a href='/post/{p['id']}'><b>{p['title']}</b></a></div>"
         for p in posts)
@@ -503,6 +528,36 @@ def index():
       <p class='muted'>Флаг засчитывается один раз. Очки сразу обновятся в шапке и в рейтинге.</p>
     </div>"""
     return page(body)
+
+
+# ТАСК 5: SQL-инъекция в поиске. Ввод склеивается с запросом через f-строку,
+# поэтому через UNION можно вытащить любую таблицу (например, secrets.flag).
+@app.route("/search")
+def search():
+    q = request.args.get("q", "")
+    # Колонок в выборке ровно две (id, title) — те же, что рисуем в выдаче.
+    # Так UNION-инъекция подходит по числу столбцов: ' UNION SELECT id,flag FROM secrets--
+    sql = f"SELECT id, title FROM posts WHERE title LIKE '%{q}%' OR body LIKE '%{q}%'"
+    rows = []
+    error = ""
+    try:
+        rows = get_db().execute(sql).fetchall()
+    except sqlite3.Error as e:
+        # ТАСК 5: текст ошибки БД показываем пользователю как есть —
+        # так новичку проще разбирать синтаксис собственного payload'а
+        error = str(e)
+    if error:
+        result = f"<p class='warn'>SQL error: {escape(error)}</p>"
+    elif not rows:
+        result = "<p class='muted'>Ничего не нашлось.</p>"
+    else:
+        # без экранирования, как и везде в этом стенде
+        result = "".join(
+            f"<div class='post'><a href='/post/{r[0]}'><b>{r[1]}</b></a></div>"
+            for r in rows)
+    return page(f"<h2>Поиск</h2>{search_form(q)}"
+                f"<p class='muted'>Запрос: <code>{escape(q)}</code> · найдено: {len(rows)}</p>"
+                f"{result}")
 
 
 @app.route("/register", methods=["GET", "POST"])
