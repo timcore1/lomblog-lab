@@ -14,6 +14,10 @@ app = Flask(__name__)
 # ТАСК 3: секретный ключ захардкожен и слабый. Так делать НЕЛЬЗЯ. Но все делают...
 app.secret_key = "supersecret123"
 
+# ТАСК 6: флаг таска SSTI лежит прямо в конфиге Flask. В UI его нет —
+# достаётся только из шаблона: {{config.FLAG_SSTI}} (а {{config}} светит и SECRET_KEY)
+app.config["FLAG_SSTI"] = "TIMCORE{jinja_rce_7x7_49}"
+
 # Чтобы кириллица и эмодзи в JSON-ответах движка были читаемыми, а не \uXXXX
 app.json.ensure_ascii = False
 
@@ -447,11 +451,13 @@ def nav():
                 f"(id={session['user_id']}) | "
                 f"<a href='/welcome'>🎯 Миссия</a> | "
                 f"<a href='/scoreboard'>🏆 Рейтинг</a> | "
+                f"<a href='/hello'>👋 Скажи привет</a> | "
                 f"<span id='nav-points' title='твои очки'>⭐ Очки: {st['points']}</span> | "
                 f"<a href='/profile/{session['user_id']}'>Мой профиль</a> | "
                 f"<a href='/logout'>Выйти</a>")
     return ("<a href='/welcome'>🎯 Миссия</a> | "
             "<a href='/scoreboard'>🏆 Рейтинг</a> | "
+            "<a href='/hello'>👋 Скажи привет</a> | "
             "<a href='/login'>Войти</a> | <a href='/register'>Регистрация</a>")
 
 
@@ -558,6 +564,16 @@ def search():
     return page(f"<h2>Поиск</h2>{search_form(q)}"
                 f"<p class='muted'>Запрос: <code>{escape(q)}</code> · найдено: {len(rows)}</p>"
                 f"{result}")
+
+
+# ТАСК 6: SSTI. Имя попадает в текст шаблона f-строкой ДО рендера,
+# поэтому Jinja честно исполняет всё, что ввёл пользователь: {{7*7}}, {{config}}...
+@app.route("/hello")
+def hello():
+    name = request.args.get("name", "гость")
+    # тело страницы собираем сразу в шаблоне — не экранируем и не проверяем
+    return render_template_string(
+        BASE % (nav(), progress(), f"<h2>Привет, {name}!</h2>"))
 
 
 @app.route("/register", methods=["GET", "POST"])
