@@ -56,9 +56,12 @@ docker run --rm -p 5001:5001 lomblog
 **Локально:**
 
 ```bash
+python -m venv .venv && source .venv/bin/activate   # на Kali/Parrot обязателен
 pip install -r requirements.txt
 python app.py
 ```
+
+> На Kali/Parrot/Debian системный `pip` отвечает `externally-managed-environment` (PEP 668). Варианты: venv выше либо `pip install --user --break-system-packages -r requirements.txt`.
 
 Открывай http://127.0.0.1:5001 — и в бой. Прокси на Burp Suite / ZAP настраивается по вкусу. 😎
 

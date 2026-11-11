@@ -9,7 +9,19 @@ from datetime import datetime
 from urllib.parse import quote
 from flask import Flask, request, session, redirect, render_template_string, g, abort
 from markupsafe import escape
-import jwt  # ТАСК 8: PyJWT для мини-API (Flask-сессии живут отдельно)
+# ТАСК 8: PyJWT для мини-API (Flask-сессии живут отдельно).
+# На Kali/Parrot pip «из коробки» ругается externally-managed-environment:
+# тогда либо venv, либо pip install --user --break-system-packages (см. README).
+try:
+    import jwt
+except ModuleNotFoundError:
+    raise SystemExit(
+        "Не хватает PyJWT.\n"
+        "  python -m pip install -r requirements.txt\n"
+        "  если pip ругается externally-managed-environment:\n"
+        "  python -m pip install --user --break-system-packages 'PyJWT>=2.8'\n"
+        "  или создай venv: python -m venv .venv && source .venv/bin/activate\n"
+    )
 
 app = Flask(__name__)
 

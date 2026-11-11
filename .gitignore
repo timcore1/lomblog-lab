@@ -3,4 +3,6 @@ flag.txt
 __pycache__/
 *.pyc
 .vscode/
+.venv/
+venv/
 TEACHER_SOLUTIONS.md
