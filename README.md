@@ -3,13 +3,13 @@
 <img width="1280" height="640" alt="lomblog-github-banner" src="https://github.com/user-attachments/assets/b517ea9c-5b75-4b1e-888e-e5056ff97f0e" />
 
 **Намеренно уязвимый веб-блог для обучения пентесту.**
-9 тасков · флаги · Docker за 30 секунд · Flask + PyJWT
+10 тасков · флаги · Docker за 30 секунд · Flask + PyJWT
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Flask](https://img.shields.io/badge/flask-3.x-000000?logo=flask&logoColor=white)
 ![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)
-![CTF](https://img.shields.io/badge/CTF-9%20flags-6d28d9)
+![CTF](https://img.shields.io/badge/CTF-10%20flags-6d28d9)
 
 ---
 
@@ -38,12 +38,15 @@
 | 7 | Выберись из папки с материалами курса | Path traversal | ⭐⭐⭐ |
 | 8 | Подделай JWT и попади в админ-API | JWT: слабый секрет / alg=none | ⭐⭐⭐⭐ |
 | 9 | Заставь сервер сходить на служебный адрес | SSRF (превью ссылок) | ⭐⭐⭐⭐ |
+| 10 | Накрути лайки в обход «один лайк на сессию» | Race condition (TOCTOU) | ⭐⭐⭐⭐⭐ |
 
 Дыр больше, чем заданий — бонусы тем, кто смотрит шире списка. 😉
 
 Таск 8 живёт в мини-API: `POST /api/login` выдаёт JWT, `GET /api/admin/flag` его проверяет. Подпись HS256 — присмотрись к секрету (jwt_tool со словарём или hashcat -m 16500) и к тому, что бывает, если библиотека доверяет полю `alg` из токена.
 
 Таск 9 — «превью ссылок» на странице поста: `GET /preview?url=...` ходит по указанному адресу от имени сервера. Служебный `/internal/metadata` снаружи «недоступен» — но только потому, что о нём никто не знает. Попроси сервер сходить туда сам.
+
+Таск 10 — лайки под постами. Кнопка «❤️» пускает один лайк на сессию, но помнит об этом только cookie, а счётчик обновляется не атомарно. Постучись в `POST /like/<id>` сотней параллельных запросов с одной и той же сессией — и загляни в `/flag/race`.
 
 ## 🚀 Quickstart
 
@@ -72,7 +75,7 @@ python app.py
 
 ```
 lomblog-lab/
-├── app.py              # весь стенд — один файл (~1100 строк)
+├── app.py              # весь стенд — один файл (~1180 строк)
 ├── requirements.txt    # flask, PyJWT, и всё
 ├── Dockerfile          # python:3.12-slim, multi-arch
 └── README.md
@@ -88,9 +91,10 @@ lomblog-lab/
 
 - [ ] Игровой режим: автопроверка флагов, очки, scoreboard
 - [ ] Достижения и подсказки за очки
-- [ ] Новые таски: XXE, race condition, deserialization
+- [ ] Новые таски: XXE, deserialization, prototype pollution
 - [x] JWT-контур: слабый секрет и alg=none
 - [x] SSRF: превью ссылок и cloud metadata
+- [x] Race condition: TOCTOU в лайках
 - [ ] Attack-Defense режим для командных зачётов
 
 ## 🤝 Contributing

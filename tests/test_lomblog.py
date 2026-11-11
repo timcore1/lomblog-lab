@@ -227,5 +227,76 @@ class SsrfTest(unittest.TestCase):
         self.assertGreater(row["points"], 0)
 
 
+class LikeTest(unittest.TestCase):
+    """Таск 10: одиночный лайк и UI (сам race condition живёт в test_race.py)."""
+
+    POST_ID = 2
+
+    def setUp(self):
+        lab.app.config["TESTING"] = True
+        self.client = lab.app.test_client()
+        with lab.app.app_context():
+            db = lab.get_db()
+            db.execute("UPDATE posts SET likes=0 WHERE id=?", (self.POST_ID,))
+            db.commit()
+
+    def likes(self):
+        with lab.app.app_context():
+            return lab.get_db().execute(
+                "SELECT likes FROM posts WHERE id=?", (self.POST_ID,)).fetchone()["likes"]
+
+    def test_single_like_increments_by_one(self):
+        with self.client.session_transaction() as sess:
+            sess["user_id"] = 2
+            sess["username"] = "alice"
+        before = self.likes()
+        r = self.client.post(f"/like/{self.POST_ID}")
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(self.likes(), before + 1)
+
+    def test_second_like_in_same_session_is_blocked(self):
+        with self.client.session_transaction() as sess:
+            sess["user_id"] = 2
+            sess["username"] = "alice"
+        self.client.post(f"/like/{self.POST_ID}")
+        after_first = self.likes()
+        self.client.post(f"/like/{self.POST_ID}")
+        self.assertEqual(self.likes(), after_first)
+
+    def test_like_button_is_on_index_and_post_page(self):
+        with self.client.session_transaction() as sess:
+            sess["user_id"] = 2
+            sess["username"] = "alice"
+        index_html = self.client.get("/").get_data(as_text=True)
+        post_html = self.client.get(f"/post/{self.POST_ID}").get_data(as_text=True)
+        for html in (index_html, post_html):
+            self.assertIn(f"action='/like/{self.POST_ID}'", html)
+            self.assertIn("like-btn", html)
+
+    def test_race_flag_page_hints_until_threshold(self):
+        with lab.app.app_context():
+            db = lab.get_db()
+            db.execute("UPDATE posts SET likes=0")
+            db.commit()
+        data = self.client.get("/flag/race").get_json()
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["need"], lab.RACE_TARGET)
+        self.assertIn("не хватает", data["hint"])
+
+    def test_race_flag_is_registered_in_game(self):
+        with lab.app.app_context():
+            row = lab.get_db().execute(
+                "SELECT value, points FROM flags WHERE name='Race'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["value"], lab.FLAG_RACE)
+        self.assertGreater(row["points"], 0)
+
+    def test_likes_column_exists_in_schema(self):
+        # Миграция должна работать и на базе, созданной до таска 10
+        with lab.app.app_context():
+            cols = [r[1] for r in lab.get_db().execute("PRAGMA table_info(posts)")]
+        self.assertIn("likes", cols)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@
 """
 import sqlite3
 import os
+import time
 import urllib.request
 from datetime import datetime
 from urllib.parse import quote
@@ -45,6 +46,10 @@ FLAG_SSTI = "TIMCORE{jinja_rce_7x7_49}"
 FLAG_TRAVERSAL = "TIMCORE{dot_dot_slash_p4th_tr4v3rs4l}"
 FLAG_JWT = "TIMCORE{jwt_n0n3_4lg_w0w}"
 FLAG_SSRF = "TIMCORE{ssrf_m3t4d4t4_l0v3ly}"
+FLAG_RACE = "TIMCORE{r4c3_c0nd1t10n_w1n}"
+
+# ТАСК 10: порог лайков, после которого «внутренняя» ручка отдаёт флаг
+RACE_TARGET = 100
 
 # ТАСК 8: секрет подписи JWT намеренно слабый — брутится по словарю
 # (jwt_tool / hashcat -m 16500) за пару секунд. Так делать НЕЛЬЗЯ.
@@ -90,7 +95,10 @@ def init_db():
     CREATE TABLE IF NOT EXISTS posts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
-        body TEXT
+        body TEXT,
+        -- ТАСК 10: счётчик лайков. Уникальности «юзер→пост» нет намеренно:
+        -- защита от накрутки живёт только в cookie сессии (см. /like/<id>).
+        likes INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS comments(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,6 +143,12 @@ def init_db():
         UNIQUE(user_id, code)
     );
     """)
+    # ТАСК 10: миграция для баз, созданных до появления лайков.
+    # Нужно ли пересоздать базу с нуля? Удали lomblog.db и запусти app.py снова —
+    # файл создастся заново. Если база старая, ALTER ниже просто добавит колонку.
+    columns = [row[1] for row in db.execute("PRAGMA table_info(posts)")]
+    if "likes" not in columns:
+        db.execute("ALTER TABLE posts ADD COLUMN likes INTEGER DEFAULT 0")
     if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
         db.executemany(
             "INSERT INTO users(username,password,bio,is_admin) VALUES(?,?,?,?)",
@@ -190,6 +204,10 @@ def init_db():
              "Превью ссылки ходит по URL от имени сервера. Заставь его постучаться "
              "в самого себя: http://127.0.0.1:5001/internal/metadata — там служебный "
              "эндпоинт, который «не должен быть доступен извне»."),
+            ("Race", FLAG_RACE, 300,
+             "Лайки считаются в два шага, а «один лайк на сессию» помнит только кука. "
+             "Отправь 100+ лайков ОДНОВРЕМЕННО (Burp Intruder / ffuf / скрипт на "
+             "concurrent.futures) — потом сходи в /flag/race."),
         ],
     )
     db.commit()
@@ -274,6 +292,10 @@ a{color:#4f46e5}
 .post a{text-decoration:none;font-size:1.05rem}
 .comment b{color:#6d28d9}
 input,textarea{background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:10px;width:100%%;margin:6px 0;font-size:.95rem}
+form.like-form{display:inline-block;margin:0}
+button.like-btn{background:#fff;color:#be123c;border:1px solid #fecdd3;border-radius:999px;padding:4px 14px;font-size:.85rem;font-weight:600;line-height:1.6}
+button.like-btn:hover{background:#fff1f2;opacity:1}
+.post .like-form{float:right;margin-left:10px}
 pre.preview{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px 16px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-all;font-size:.82rem;line-height:1.45}
 input:focus,textarea:focus{outline:2px solid #818cf8;border-color:transparent}
 button{background:linear-gradient(135deg,#6d28d9,#2563eb);color:#fff;border:0;border-radius:8px;padding:10px 22px;font-size:.95rem;cursor:pointer;transition:opacity .15s}
@@ -621,7 +643,10 @@ def index():
     posts = db.execute("SELECT * FROM posts ORDER BY id").fetchall()
     body += "<h2>Поиск</h2>" + search_form()
     body += "<h2>Посты</h2>" + "".join(
-        f"<div class='post'><a href='/post/{p['id']}'><b>{p['title']}</b></a></div>"
+        f"<div class='post'>"
+        f"<form action='/like/{p['id']}' method='post' class='like-form'>"
+        f"<button class='like-btn'>❤️ {p['likes'] or 0}</button></form>"
+        f"<a href='/post/{p['id']}'><b>{p['title']}</b></a></div>"
         for p in posts)
     # Форма сдачи флага: fetch-обработчик живёт в общем JS в BASE
     body += """
@@ -786,7 +811,10 @@ def post(pid):
         "SELECT * FROM comments WHERE post_id=?", (pid,)).fetchall()
     # ТАСК 2 (пасхалка): флаг спрятан в HTML-комментарии
     body = f"""<!-- Никто не читает исходники страниц, правда? {FLAG_XSS} -->
-    <h2>{p['title']}</h2><div class='post'>{p['body']}</div>
+    <h2>{p['title']}</h2>
+    <form action='/like/{pid}' method='post' class='like-form'>
+      <button class='like-btn'>❤️ {p['likes'] or 0}</button></form>
+    <div class='post'>{p['body']}</div>
     <h3>Комментарии</h3>"""
     for c in comments:
         # вставляем сырое тело — никакого экранирования
@@ -805,6 +833,43 @@ def post(pid):
       <button>Отправить</button>
     </form>"""
     return page(body)
+
+
+# ===== ТАСК 10: race condition (TOCTOU) в лайках =====
+# «Один лайк на сессию» проверяется ТОЛЬКО по флагу в cookie: на сервере нет
+# ни UNIQUE(user_id, post_id), ни отдельной таблицы лайков. Плюс сам счётчик
+# читается и обновляется отдельными шагами (SELECT -> пауза -> UPDATE), поэтому
+# параллельные запросы все проходят проверку и все увеличивают likes.
+# Как надо: UNIQUE-констрейнт + атомарный UPDATE ... SET likes = likes + 1
+# в одной транзакции (или INSERT в likes с UNIQUE и COUNT(*) для отображения).
+@app.route("/like/<int:post_id>", methods=["POST"])
+def like_post(post_id):
+    db = get_db()
+    # Шаг 1: проверка существования поста + чтение текущего счётчика
+    row = db.execute("SELECT id, likes FROM posts WHERE id=?", (post_id,)).fetchone()
+    if not row:
+        abort(404)
+    # Шаг 2: проверка «уже лайкал» — только по данным клиента, которые он же и пришлёт
+    liked = session.get("liked_posts", [])
+    if post_id in liked:
+        return redirect(f"/post/{post_id}")
+    time.sleep(0.02)  # окно гонки: соседние запросы успевают пройти ту же проверку
+    # Шаг 3: обновление счётчика — отдельная операция, без UNIQUE и транзакции
+    db.execute("UPDATE posts SET likes = likes + 1 WHERE id=?", (post_id,))
+    db.commit()
+    session["liked_posts"] = liked + [post_id]
+    return redirect(f"/post/{post_id}")
+
+
+# Ручка «внутренней проверки»: флаг выдаётся, когда лайков накрутили на порог.
+# Прятки с сокрытием тут не работают — про роут узнают из подсказки на главной.
+@app.route("/flag/race")
+def flag_race():
+    top = get_db().execute("SELECT MAX(likes) AS m FROM posts").fetchone()["m"] or 0
+    if top >= RACE_TARGET:
+        return {"ok": True, "flag": FLAG_RACE, "likes": top}
+    return {"ok": False, "likes": top, "need": RACE_TARGET - top,
+            "hint": f"До флага не хватает ещё {RACE_TARGET - top} лайков."}
 
 
 # ТАСК 1: IDOR — никакой проверки, что профиль принадлежит юзеру
