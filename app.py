@@ -9,6 +9,7 @@ from datetime import datetime
 from urllib.parse import quote
 from flask import Flask, request, session, redirect, render_template_string, g, abort
 from markupsafe import escape
+import jwt  # ТАСК 8: PyJWT для мини-API (Flask-сессии живут отдельно)
 
 app = Flask(__name__)
 
@@ -29,6 +30,11 @@ FLAG_BACKUP = "TIMCORE{b4ckup_f1l3s_4r3_publ1c_l0l}"
 FLAG_SQLI = "TIMCORE{un10n_s3l3ct_b4by}"
 FLAG_SSTI = "TIMCORE{jinja_rce_7x7_49}"
 FLAG_TRAVERSAL = "TIMCORE{dot_dot_slash_p4th_tr4v3rs4l}"
+FLAG_JWT = "TIMCORE{jwt_n0n3_4lg_w0w}"
+
+# ТАСК 8: секрет подписи JWT намеренно слабый — брутится по словарю
+# (jwt_tool / hashcat -m 16500) за пару секунд. Так делать НЕЛЬЗЯ.
+JWT_SECRET = "secret"
 
 # ТАСК 6: флаг таска SSTI лежит прямо в конфиге Flask. В UI его нет —
 # достаётся только из шаблона: {{config.FLAG_SSTI}} (а {{config}} светит и SECRET_KEY)
@@ -162,6 +168,10 @@ def init_db():
             ("Path", FLAG_TRAVERSAL, 150,
              "Скачивание в /download клеит путь к имени файла без нормализации. "
              "Попробуй ?file=../flag.txt, а потом почитай соседний app.py."),
+            ("JWT", FLAG_JWT, 200,
+             "Мини-API: POST /api/login выдаёт JWT, GET /api/admin/flag его проверяет. "
+             "Секрет подписи — из словаря (jwt_tool с rockyou.txt), а ещё можно "
+             "подменить alg на none и выкинуть подпись."),
         ],
     )
     db.commit()
@@ -695,6 +705,47 @@ def login():
 def logout():
     session.clear()
     return redirect("/")
+
+
+# ===== Мини-API (таск 8): JWT =====
+# Отдельный stateless-контур для «мобильного клиента»: Flask-сессии тут не участвуют.
+# Обе дыры намеренные: слабый HS256-секрет и приём токенов с alg=none.
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    u = get_db().execute(
+        "SELECT * FROM users WHERE username=? AND password=?",
+        (username, password)).fetchone()
+    if not u:
+        return {"ok": False, "error": "invalid credentials"}, 401
+    role = "admin" if u["is_admin"] else "user"
+    # ТАСК 8: секрет JWT_SECRET слабый, а роль едет в payload без дополнительных проверок
+    token = jwt.encode({"user": u["username"], "role": role},
+                       JWT_SECRET, algorithm="HS256")
+    return {"ok": True, "token": token, "token_type": "Bearer", "role": role}
+
+
+@app.route("/api/admin/flag")
+def api_admin_flag():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return {"ok": False, "error": "Bearer token required"}, 401
+    token = auth[len("Bearer "):].strip()
+    try:
+        header = jwt.get_unverified_header(token)
+        if header.get("alg") == "none":
+            # ТАСК 8: доверяем alg из токена и принимаем пустую подпись.
+            # Именно так делать НЕЛЬЗЯ: подпись не проверяется вообще.
+            payload = jwt.decode(token, options={"verify_signature": False})
+        else:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return {"ok": False, "error": "invalid token"}, 401
+    if payload.get("role") != "admin":
+        return {"ok": False, "error": "admin only"}, 403
+    return {"ok": True, "flag": FLAG_JWT}
 
 
 @app.route("/post/<int:pid>", methods=["GET", "POST"])
