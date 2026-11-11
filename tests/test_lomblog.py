@@ -7,12 +7,14 @@ import base64
 import json
 import os
 import sys
+import threading
 import unittest
 
 # Чтобы `python -m unittest discover -s tests` видел app.py из корня проекта
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jwt  # noqa: E402
+from werkzeug.serving import make_server  # noqa: E402
 
 import app as lab  # noqa: E402
 
@@ -141,6 +143,87 @@ class OldVectorsTest(unittest.TestCase):
                 "SELECT value, points FROM flags WHERE name='JWT'").fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["value"], lab.FLAG_JWT)
+        self.assertGreater(row["points"], 0)
+
+
+class SsrfTest(unittest.TestCase):
+    """Таск 9: превью ссылок ходит куда угодно — в том числе в свой же сервер.
+
+    /preview реально дергает urllib.request, поэтому для проверки поднимаем
+    живой сервер на localhost (как в настоящей лабе).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import socket
+
+        def port_free(p):
+            with socket.socket() as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(("127.0.0.1", p))
+                    return True
+                except OSError:
+                    return False
+
+        # По умолчанию — «как в лабе» 5001; если он занят, берём свободный порт
+        port = 5001 if port_free(5001) else 0
+        try:
+            cls.server = make_server("127.0.0.1", port, lab.app, threaded=True)
+        except (OSError, SystemExit):
+            cls.server = make_server("127.0.0.1", 0, lab.app, threaded=True)
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        lab.app.config["TESTING"] = True
+        self.client = lab.app.test_client()
+
+    def preview(self, url):
+        return self.client.get("/preview", query_string={"url": url})
+
+    def test_preview_fetches_index_html(self):
+        r = self.preview(self.base + "/")
+        self.assertEqual(r.status_code, 200)
+        html = r.get_data(as_text=True)
+        # главная (для гостя — /welcome) отдалась целиком через SSRF
+        self.assertIn("ЛомБлог", html)
+        self.assertIn("<pre class='preview'>", html)
+
+    def test_preview_reads_internal_metadata(self):
+        r = self.preview(self.base + "/internal/metadata")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(lab.FLAG_SSRF, r.get_data(as_text=True))
+
+    def test_internal_metadata_is_not_linked_in_ui(self):
+        # Защита через сокрытие: роут работает, но ссылки на него нет
+        for path in ("/", "/welcome", "/post/1"):
+            html = self.client.get(path).get_data(as_text=True)
+            self.assertNotIn("/internal/metadata", html)
+
+    def test_preview_shows_connection_error_as_text(self):
+        # Порт 1 на localhost закрыт: ошибка должна быть текстом, а не 500
+        r = self.preview("http://127.0.0.1:1/nope")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("Не удалось получить", r.get_data(as_text=True))
+
+    def test_preview_form_on_post_page(self):
+        html = self.client.get("/post/1").get_data(as_text=True)
+        self.assertIn("action='/preview'", html)
+        self.assertIn("name='url'", html)
+
+    def test_ssrf_flag_is_registered_in_game(self):
+        with lab.app.app_context():
+            row = lab.get_db().execute(
+                "SELECT value, points FROM flags WHERE name='SSRF'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["value"], lab.FLAG_SSRF)
         self.assertGreater(row["points"], 0)
 
 

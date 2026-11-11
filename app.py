@@ -5,6 +5,7 @@
 """
 import sqlite3
 import os
+import urllib.request
 from datetime import datetime
 from urllib.parse import quote
 from flask import Flask, request, session, redirect, render_template_string, g, abort
@@ -43,6 +44,7 @@ FLAG_SQLI = "TIMCORE{un10n_s3l3ct_b4by}"
 FLAG_SSTI = "TIMCORE{jinja_rce_7x7_49}"
 FLAG_TRAVERSAL = "TIMCORE{dot_dot_slash_p4th_tr4v3rs4l}"
 FLAG_JWT = "TIMCORE{jwt_n0n3_4lg_w0w}"
+FLAG_SSRF = "TIMCORE{ssrf_m3t4d4t4_l0v3ly}"
 
 # ТАСК 8: секрет подписи JWT намеренно слабый — брутится по словарю
 # (jwt_tool / hashcat -m 16500) за пару секунд. Так делать НЕЛЬЗЯ.
@@ -184,6 +186,10 @@ def init_db():
              "Мини-API: POST /api/login выдаёт JWT, GET /api/admin/flag его проверяет. "
              "Секрет подписи — из словаря (jwt_tool с rockyou.txt), а ещё можно "
              "подменить alg на none и выкинуть подпись."),
+            ("SSRF", FLAG_SSRF, 250,
+             "Превью ссылки ходит по URL от имени сервера. Заставь его постучаться "
+             "в самого себя: http://127.0.0.1:5001/internal/metadata — там служебный "
+             "эндпоинт, который «не должен быть доступен извне»."),
         ],
     )
     db.commit()
@@ -268,6 +274,7 @@ a{color:#4f46e5}
 .post a{text-decoration:none;font-size:1.05rem}
 .comment b{color:#6d28d9}
 input,textarea{background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:10px;width:100%%;margin:6px 0;font-size:.95rem}
+pre.preview{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px 16px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-all;font-size:.82rem;line-height:1.45}
 input:focus,textarea:focus{outline:2px solid #818cf8;border-color:transparent}
 button{background:linear-gradient(135deg,#6d28d9,#2563eb);color:#fff;border:0;border-radius:8px;padding:10px 22px;font-size:.95rem;cursor:pointer;transition:opacity .15s}
 button:hover{opacity:.85}
@@ -569,6 +576,7 @@ def page(body):
     # Обычные страницы НЕ прогоняем через Jinja: иначе любой {{...}} из БД
     # (подсказки, посты, комменты) исполнится и сольёт флаг/секретный ключ.
     # Шаблонный движок включается только в таске 6 (/hello) — там это и есть дырка.
+    # %-форматирование применяется только к BASE: проценты внутри body безопасны.
     return BASE % (nav(), progress(), body)
 
 
@@ -784,6 +792,14 @@ def post(pid):
         # вставляем сырое тело — никакого экранирования
         body += f"<div class='comment'><b>{c['author']}:</b> {c['body']}</div>"
     body += """
+    <h3>Предпросмотр ссылки</h3>
+    <div class='post'>
+      <form action='/preview' method='get'>
+        <input name='url' placeholder='https://example.com' autocomplete='off' required>
+        <button>🔍 Предпросмотр</button>
+      </form>
+      <p class='muted'>Сервер сам сходит по ссылке и покажет первые 500 байт ответа.</p>
+    </div>
     <form method=post>
       <textarea name=body rows=3 placeholder='Твой комментарий...'></textarea>
       <button>Отправить</button>
@@ -868,6 +884,45 @@ def backup_sql():
         dump += (f"INSERT INTO users VALUES({u['id']},'{u['username']}',"
                  f"'{u['password']}');\n")
     return dump, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ===== «Внутренний» сервис: cloud metadata (таск 9) =====
+# Имитация cloud metadata: этот эндпоинт не должен быть доступен извне —
+# в реальном облаке сюда приходят учётные данные инстанса.
+# Защита через сокрытие: ссылки на роут нет ни в навигации, ни в UI —
+# но кто знает путь, тот его откроет. В том числе сам сервер, если его
+# попросить сходить сюда через /preview.
+@app.route("/internal/metadata")
+def internal_metadata():
+    return {"instance": "lomblog-prod", "flag": FLAG_SSRF}
+
+
+# ТАСК 9: SSRF в «превью ссылок». URL приходит от пользователя и уходит в
+# urllib.request БЕЗ проверки схемы и хоста: можно стучаться в localhost,
+# во внутреннюю сеть и даже читать file://. Так делать НЕЛЬЗЯ.
+@app.route("/preview")
+def preview():
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return redirect("/")
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            raw = resp.read(500)  # показываем только первые 500 байт ответа
+            status = resp.status
+            final_url = resp.geturl()
+    except Exception as e:
+        # ошибку показываем как текст — новичку проще понять, что не так
+        return page(f"<h2>Предпросмотр ссылки</h2>"
+                    f"<p class='warn'>Не удалось получить {escape(url)}: "
+                    f"{escape(str(e))}</p>"
+                    f"<p class='muted'><a href='/'>← На главную</a></p>")
+    text = raw.decode("utf-8", errors="replace")
+    return page(f"""
+    <h2>Предпросмотр ссылки</h2>
+    <p class='muted'>URL: <code>{escape(url)}</code> · HTTP {status}</p>
+    <p class='muted'>Финальный адрес: <code>{escape(final_url)}</code>
+       · первые 500 байт</p>
+    <pre class='preview'>{escape(text)}</pre>""")
 
 
 # ТАСК 7: path traversal. Имя файла клеится к пути БЕЗ нормализации и проверок,
