@@ -13,6 +13,9 @@ import sys
 import threading
 import unittest
 
+# Бот-модератор (таск 11) в этом наборе не нужен
+os.environ.setdefault("LOMBLOG_BOT", "0")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as lab  # noqa: E402

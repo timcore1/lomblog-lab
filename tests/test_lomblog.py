@@ -10,6 +10,9 @@ import sys
 import threading
 import unittest
 
+# Бот-модератор таска 11 не нужен в этих тестах: не поднимаем его при импорте app
+os.environ.setdefault("LOMBLOG_BOT", "0")
+
 # Чтобы `python -m unittest discover -s tests` видел app.py из корня проекта
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
